@@ -21,7 +21,13 @@ class Settings(BaseSettings):
     DEEPSEEK_API_KEY: str = ""
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
     DEEPSEEK_CHAT_MODEL: str = "deepseek-chat"
+    
+    MISTRAL_API_KEY: str = ""
+    MISTRAL_OCR_ENDPOINT: str = "https://api.mistral.ai/v1/ocr"
+    MISTRAL_OCR_MODEL: str = "mistral-ocr-latest"
+
     DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/nexa_db"
+
 # ...
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

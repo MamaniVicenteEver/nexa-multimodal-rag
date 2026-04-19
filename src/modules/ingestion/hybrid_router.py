@@ -1,62 +1,130 @@
-import fitz  # PyMuPDF
-from src.core.ports.ocr_provider import IOCRProvider
+"""
+Orquestador híbrido para procesamiento de PDFs.
+
+Versión simplificada que delega en un IPageProcessor.
+
+Flujo:
+  1. Abre el PDF y clasifica cada página.
+  2. Separa índices LOCAL y OCR.
+  3. Procesa LOCAL con extract_local().
+  4. Procesa OCR delegando en self.page_processor.
+  5. Ensambla Markdown final.
+"""
+
+import fitz
+import os
+import time
+from typing import List, Tuple, Dict
+
+from src.core.ports.page_processor import IPageProcessor
+from src.infrastructure.ocr.processors.base import (
+    classify_page,
+    is_page_meaningful,
+    extract_local,
+    PageRoute,
+)
 from src.shared.logging import get_logger
 
 logger = get_logger("hybrid_router")
 
+DEBUG_DIR = os.path.join(os.getcwd(), "data", "debug")
+os.makedirs(DEBUG_DIR, exist_ok=True)
+
+
 class HybridDocumentProcessor:
-    def __init__(self, visual_ocr_adapter: IOCRProvider):
-        self.visual_ocr = visual_ocr_adapter
+    """
+    Orquestador de extracción de PDFs.
+
+    Recibe un IPageProcessor que sabe cómo manejar las páginas OCR.
+    """
+
+    def __init__(self, page_processor: IPageProcessor):
+        self.page_processor = page_processor
 
     async def process_pdf(self, pdf_bytes: bytes, doc_id: str) -> str:
+        """
+        Procesa un PDF completo y devuelve un único Markdown.
+        """
+        t_start = time.monotonic()
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        extracted_markdown_parts = []
         total_pages = len(doc)
-        
-        logger.info("Iniciando enrutamiento híbrido", extra={"doc_id": doc_id, "total_pages": total_pages})
 
-        pages_sent_to_api = 0
-        pages_processed_locally = 0
+        logger.info(f"INICIO procesamiento PDF — doc_id={doc_id}, páginas={total_pages}")
 
-        for page_num in range(total_pages):
-            page = doc[page_num]
+        # FASE 1: Clasificación local de todas las páginas
+        local_indices: List[int] = []
+        ocr_indices: List[int] = []
+        skipped = 0
 
-            has_images = len(page.get_images(full=True)) > 0
-            has_vector_drawings = len(page.get_drawings()) > 0
-            text_content = page.get_text("text").strip()
-            
-            is_complex_page = has_images or has_vector_drawings or len(text_content) < 50
+        for pnum in range(total_pages):
+            page = doc[pnum]
+            text = page.get_text("text").strip()
 
-            if is_complex_page:
-                logger.debug(f"Página {page_num + 1} enrutada a DeepSeek-OCR (Compleja)")
-                pages_sent_to_api += 1
-                
-                # CORRECCIÓN: Forzamos alpha=False para eliminar transparencias que rompen la API
-                # Usamos PNG para evitar pérdida de calidad en texto pequeño
-                pix = page.get_pixmap(dpi=150, alpha=False)
-                image_bytes = pix.tobytes("png")
+            if not is_page_meaningful(page, text):
+                logger.info(f"Pág {pnum+1}: OMITIDA (vacía)")
+                skipped += 1
+                continue
 
-                try:
-                    md_text = await self.visual_ocr.extract(image_bytes)
-                    extracted_markdown_parts.append(f"\n\n\n\n{md_text}")
-                except Exception as e:
-                    logger.error(f"Fallo el OCR Visual en la página {page_num + 1}", exc_info=True)
-                    extracted_markdown_parts.append(f"\n\n")
+            route, _, reason = classify_page(page)
+            logger.info(f"Pág {pnum+1}: {route.upper()} ← {reason}")
+
+            if route == PageRoute.LOCAL:
+                local_indices.append(pnum)
             else:
-                logger.debug(f"Página {page_num + 1} enrutada a PyMuPDF (Texto simple)")
-                pages_processed_locally += 1
-                extracted_markdown_parts.append(f"\n\n\n\n{text_content}")
+                ocr_indices.append(pnum)
 
-        doc.close()
-        
         logger.info(
-            "Análisis de PDF completado", 
-            extra={
-                "doc_id": doc_id, 
-                "pages_local": pages_processed_locally, 
-                "pages_api": pages_sent_to_api,
-                "api_savings_percentage": round((pages_processed_locally / total_pages) * 100, 2) if total_pages > 0 else 0
-            }
+            f"Clasificación: LOCAL={len(local_indices)}, OCR={len(ocr_indices)}, OMITIDAS={skipped}"
         )
 
-        return "".join(extracted_markdown_parts)
+        # FASE 2: Procesamiento
+        page_results: Dict[int, Tuple[str, List[str]]] = {}
+
+        # 2a. Páginas locales (gratis)
+        for idx in local_indices:
+            page = doc[idx]
+            page_results[idx] = (extract_local(page), [])
+
+        # 2b. Páginas OCR (delegar en el procesador inyectado)
+        if ocr_indices:
+            logger.info(f"Delegando {len(ocr_indices)} páginas OCR a {self.page_processor.__class__.__name__}")
+            ocr_results = await self.page_processor.process_pages(
+                pdf_bytes=pdf_bytes,
+                page_indices=ocr_indices,
+                doc_id=doc_id,
+            )
+            page_results.update(ocr_results)
+        else:
+            logger.info("Sin páginas OCR. No se llama a la API.")
+
+        # FASE 3: Ensamblado final (en orden de página)
+        parts = []
+        for pnum in range(total_pages):
+            if pnum in page_results:
+                md, urls = page_results[pnum]
+                header = f"\n\n{'='*40}\n📄 PÁGINA {pnum+1}\n{'='*40}\n\n"
+                img_section = ""
+                if urls and "deepseek" in self.page_processor.__class__.__name__.lower():
+                    # Para DeepSeek añadimos sección de imágenes (Mistral ya las tiene incrustadas)
+                    img_section = "\n\n**Imágenes extraídas:**\n" + "\n".join(
+                        f"![Imagen]({url})" for url in urls
+                    )
+                parts.append(header + md + img_section)
+            else:
+                # Página omitida o no procesada
+                parts.append(f"\n\n{'='*40}\n📄 PÁGINA {pnum+1} [OMITIDA]\n{'='*40}\n\n")
+
+        doc.close()
+        final_md = "".join(parts)
+
+        # Guardar debug final
+        debug_path = os.path.join(DEBUG_DIR, f"{doc_id}_final.md")
+        with open(debug_path, "w", encoding="utf-8") as f:
+            f.write(final_md)
+
+        t_total = time.monotonic() - t_start
+        logger.info(
+            f"FIN procesamiento — doc_id={doc_id}, páginas_procesadas={len(page_results)}, "
+            f"omitidas={skipped}, chars={len(final_md):,}, tiempo={t_total:.1f}s"
+        )
+        return final_md

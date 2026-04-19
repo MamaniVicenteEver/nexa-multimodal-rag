@@ -4,9 +4,10 @@ from src.core.ports.ocr_provider import IOCRProvider
 from src.core.ports.embedding_provider import IEmbeddingProvider
 from src.core.ports.vector_store import IVectorStore
 from src.core.ports.database_repository import IDatabaseRepository
-
-from src.modules.ingestion.chunker import DocumentChunker
+from src.infrastructure.ocr.processors.factory import get_page_processor
 from src.modules.ingestion.hybrid_router import HybridDocumentProcessor
+from src.modules.ingestion.chunker import DocumentChunker
+#from modules.ingestion.hybrid_router_mistral import HybridDocumentProcessor
 from src.shared.logging import get_logger
 
 logger = get_logger("ingestion_service")
@@ -36,8 +37,9 @@ async def process_document_task(
             "mime_type": mime_type
         })
         
-        hybrid_processor = HybridDocumentProcessor(visual_ocr_adapter=ocr_adapter)
-        
+        page_processor = get_page_processor()
+        hybrid_processor = HybridDocumentProcessor(page_processor=page_processor)
+            
         # 1. Estrategia de Extracción
         if mime_type == "application/pdf":
             logger.info(f"Archivo PDF detectado ({file_extension}). Iniciando Enrutamiento Híbrido.")
@@ -54,12 +56,27 @@ async def process_document_task(
         else:
             raise ValueError(f"Formato no soportado: {mime_type}")
         
-        # 2. Chunking Semántico
+# 2. Chunking Semántico
         text_chunks = chunker.split_text(markdown_text)
         total_chunks = len(text_chunks)
         logger.info("Chunking completado", extra={"total_chunks": total_chunks})
         
-        # 3. Vectorización
+        # =====================================================================
+        # 🛑 MODO PRUEBAS (DEBUG OCR): Desactivamos temporalmente los Embeddings
+        # y ChromaDB para no consumir cuota/dinero de Gemini mientras calibramos el OCR.
+        # =====================================================================
+        logger.warning("Modo Pruebas Activo: Se ha omitido la vectorización en Gemini y la persistencia en ChromaDB para ahorrar tokens.")
+        
+        """
+        # ---------------------------------------------------------------------
+        # CÓDIGO DE PRODUCCIÓN COMENTADO (Descomentar al finalizar pruebas OCR)
+        # ---------------------------------------------------------------------
+        
+        # TODO (Optimización de Rendimiento Futura - Batching): 
+        # Actualmente se procesa 1 a 1. Debemos actualizar el 'embed_adapter' para 
+        # que reciba la lista entera de 'text_chunks' y devuelva todos los vectores 
+        # en una sola llamada HTTP (Batch). Esto reducirá la latencia dramáticamente.
+        
         chunks_to_save = []
         for text in text_chunks:
             embedding = embed_adapter.embed_text(text)
@@ -68,11 +85,12 @@ async def process_document_task(
             
         # 4. Persistencia Aislada en ChromaDB
         vector_store.upsert(collection_id, chunks_to_save)
+        """
         
         # 5. Actualizar Métricas y Estado FINAL a READY en PostgreSQL
         db_adapter.update_metrics(collection_id=collection_id, doc_id=doc_id, new_chunks=total_chunks)
         
-        logger.info("Procesamiento en segundo plano FINALIZADO con éxito", extra={"doc_id": doc_id, "status": "ready"})
+        logger.info("Procesamiento en segundo plano FINALIZADO con éxito (Sin Vectores)", extra={"doc_id": doc_id, "status": "ready"})
             
     except Exception as e:
         # 1. El log guarda el error, stacktrace, doc_id y collection_id en logs/error.log

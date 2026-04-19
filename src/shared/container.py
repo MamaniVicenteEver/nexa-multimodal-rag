@@ -1,3 +1,4 @@
+from asyncio.log import logger
 from src.infrastructure.database.postgres_adapter import PostgresRepositoryAdapter
 from src.core.ports.database_repository import IDatabaseRepository
 from src.shared.config import settings
@@ -12,6 +13,7 @@ from src.infrastructure.embeddings.gemini_embedding_adapter import GeminiEmbeddi
 from src.infrastructure.vector_stores.chromadb_adapter import ChromaDBAdapter
 from src.infrastructure.llm.deepseek_llm_adapter import DeepSeekLLMAdapter
 from src.infrastructure.storage.local_storage_adapter import LocalStorageAdapter
+from src.infrastructure.ocr.mistral_adapter import MistralOCRAdapter
 
 class Container:
     # Patrón Singleton perezoso para las instancias compartidas
@@ -70,3 +72,21 @@ class Container:
         if cls._database_repository is None:
             cls._database_repository = PostgresRepositoryAdapter()
         return cls._database_repository
+    
+    @classmethod
+    def get_ocr_provider(cls) -> IOCRProvider:
+        if cls._ocr_provider is None:
+            provider = settings.OCR_PROVIDER.lower()
+            
+            if provider == "deepseek":
+                logger.info("Iniciando motor OCR: DeepSeek")
+                cls._ocr_provider = DeepSeekOCRAdapter()
+            
+            elif provider == "mistral":
+                logger.info("Iniciando motor OCR: Mistral")
+                cls._ocr_provider = MistralOCRAdapter()
+                
+            else:
+                raise ValueError(f"OCR Provider '{provider}' no soportado.")
+                
+        return cls._ocr_provider
