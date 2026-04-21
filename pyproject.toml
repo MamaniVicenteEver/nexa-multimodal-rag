@@ -19,6 +19,7 @@ dependencies = [
     "pydantic-settings[dotenv]>=2.13.1",
     "pymupdf>=1.27.2.2",
     "pypdf>=6.9.2",
+    "python-docx>=1.2.0",
     "python-dotenv>=1.2.2",
     "sqlalchemy>=2.0.49",
     "tqdm>=4.67.3",

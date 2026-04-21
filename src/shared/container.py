@@ -1,4 +1,7 @@
 from asyncio.log import logger
+from src.modules.search.service import SearchOrchestrator
+from src.core.ports.vision_provider import IVisionProvider
+from src.infrastructure.vision.gemini_flash_lite_adapter import GeminiFlashLiteVisionAdapter
 from src.infrastructure.database.postgres_adapter import PostgresRepositoryAdapter
 from src.core.ports.database_repository import IDatabaseRepository
 from src.shared.config import settings
@@ -23,6 +26,8 @@ class Container:
     _llm_client: ILLMClient = None
     _file_storage: IFileStorage = None
     _database_repository: IDatabaseRepository = None
+    _vision_provider: IVisionProvider = None
+    _search_orchestrator: SearchOrchestrator = None 
 
     @classmethod
     def get_ocr_provider(cls) -> IOCRProvider:
@@ -90,3 +95,23 @@ class Container:
                 raise ValueError(f"OCR Provider '{provider}' no soportado.")
                 
         return cls._ocr_provider
+    
+    @classmethod
+    def get_vision_provider(cls):
+        if cls._vision_provider is None:
+            # Aquí podrías usar una variable de entorno como VISION_PROVIDER="gemini"
+            # si tuvieras más de un modelo en el futuro.
+            logger.info("Iniciando motor de Visión: Gemini Flash-Lite")
+            cls._vision_provider = GeminiFlashLiteVisionAdapter()
+        return cls._vision_provider
+
+    @classmethod
+    def get_search_orchestrator(cls) -> SearchOrchestrator:
+        if cls._search_orchestrator is None:
+            cls._search_orchestrator = SearchOrchestrator(
+                vector_store=cls.get_vector_store(),
+                embed_adapter=cls.get_embedding_provider(),  # <-- Antes era embed_provider
+                llm_client=cls.get_llm_client(),
+                db_adapter=cls.get_database_repository()
+            )
+        return cls._search_orchestrator

@@ -8,7 +8,7 @@ Flujo:
   2. Separa índices LOCAL y OCR.
   3. Procesa LOCAL con extract_local().
   4. Procesa OCR delegando en self.page_processor.
-  5. Ensambla Markdown final.
+  5. Devuelve una lista de ExtractedPage (contenido limpio + metadatos).
 """
 
 import fitz
@@ -16,6 +16,7 @@ import os
 import time
 from typing import List, Tuple, Dict
 
+from src.core.domain.extracted_page import ExtractedPage
 from src.core.ports.page_processor import IPageProcessor
 from src.infrastructure.ocr.processors.base import (
     classify_page,
@@ -41,9 +42,9 @@ class HybridDocumentProcessor:
     def __init__(self, page_processor: IPageProcessor):
         self.page_processor = page_processor
 
-    async def process_pdf(self, pdf_bytes: bytes, doc_id: str) -> str:
+    async def process_pdf(self, pdf_bytes: bytes, doc_id: str) -> List[ExtractedPage]:
         """
-        Procesa un PDF completo y devuelve un único Markdown.
+        Procesa un PDF completo y devuelve una lista de páginas extraídas.
         """
         t_start = time.monotonic()
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -97,34 +98,47 @@ class HybridDocumentProcessor:
         else:
             logger.info("Sin páginas OCR. No se llama a la API.")
 
-        # FASE 3: Ensamblado final (en orden de página)
-        parts = []
+        doc.close()
+
+        # FASE 3: Construir lista de ExtractedPage (sin cabeceras decorativas)
+        extracted_pages: List[ExtractedPage] = []
         for pnum in range(total_pages):
             if pnum in page_results:
                 md, urls = page_results[pnum]
-                header = f"\n\n{'='*40}\n📄 PÁGINA {pnum+1}\n{'='*40}\n\n"
-                img_section = ""
-                if urls and "deepseek" in self.page_processor.__class__.__name__.lower():
-                    # Para DeepSeek añadimos sección de imágenes (Mistral ya las tiene incrustadas)
-                    img_section = "\n\n**Imágenes extraídas:**\n" + "\n".join(
-                        f"![Imagen]({url})" for url in urls
+                page_type = "OCR" if pnum in ocr_indices else "LOCAL"
+                extracted_pages.append(
+                    ExtractedPage(
+                        page_number=pnum + 1,
+                        content=md,
+                        page_type=page_type,
+                        image_urls=urls,
+                        metadata={"doc_id": doc_id, "page_index": pnum},
                     )
-                parts.append(header + md + img_section)
+                )
             else:
-                # Página omitida o no procesada
-                parts.append(f"\n\n{'='*40}\n📄 PÁGINA {pnum+1} [OMITIDA]\n{'='*40}\n\n")
+                # Página omitida (vacía o irrelevante)
+                extracted_pages.append(
+                    ExtractedPage(
+                        page_number=pnum + 1,
+                        content="",
+                        page_type="OMITIDA",
+                        image_urls=[],
+                        metadata={"doc_id": doc_id, "page_index": pnum},
+                    )
+                )
 
-        doc.close()
-        final_md = "".join(parts)
-
-        # Guardar debug final
+        # Guardar debug final (opcional, ahora sin cabeceras)
+        debug_content = "\n\n".join(
+            f"<!-- PÁGINA {p.page_number} ({p.page_type}) -->\n{p.content}"
+            for p in extracted_pages if p.content
+        )
         debug_path = os.path.join(DEBUG_DIR, f"{doc_id}_final.md")
         with open(debug_path, "w", encoding="utf-8") as f:
-            f.write(final_md)
+            f.write(debug_content)
 
         t_total = time.monotonic() - t_start
         logger.info(
             f"FIN procesamiento — doc_id={doc_id}, páginas_procesadas={len(page_results)}, "
-            f"omitidas={skipped}, chars={len(final_md):,}, tiempo={t_total:.1f}s"
+            f"omitidas={skipped}, tiempo={t_total:.1f}s"
         )
-        return final_md
+        return extracted_pages

@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any
 from src.core.domain.chunk import Chunk
+from typing import List, Dict, Any, Optional
 
 class IVectorStore(ABC):
     @abstractmethod
@@ -9,6 +9,11 @@ class IVectorStore(ABC):
         pass
 
     @abstractmethod
-    def search(self, collection_id: str, query_vector: List[float], top_k: int = 5) -> List[Dict[str, Any]]:
-        """Busca fragmentos solo dentro de la colección indicada."""
+    def search(
+        self,
+        collection_id: str,
+        query_vector: List[float],
+        top_k: int = 5,
+        where: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
         pass

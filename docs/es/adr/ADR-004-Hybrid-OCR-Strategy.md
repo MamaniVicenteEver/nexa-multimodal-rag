@@ -312,3 +312,60 @@ Gracias al clasificador, de las 21 páginas totales:
 - **Ahorro:** **62% de reducción de costos**.
 
 **Conclusión Final:** El sistema está listo para producción. Mistral es el motor recomendado para entornos empresariales por su velocidad y estabilidad, mientras que DeepSeek permanece como una opción de ultra bajo costo para laboratorios y procesamiento masivo no crítico.
+
+
+## 7. Extendiendo el Sistema: Cómo Añadir un Nuevo Proveedor OCR
+
+La arquitectura está diseñada para que integrar un nuevo motor OCR (ej. **Docling**, **Tesseract**, **GPT-4o**) sea trivial. El 95% del sistema (clasificador, chunking, base de datos) permanece intacto.
+
+### Guía Rápida de Implementación (4 Pasos)
+
+Si en el futuro deseas añadir, por ejemplo, un proveedor llamado `NuevoOCR`, sigue esta checklist:
+
+| Paso | Acción | Archivo(s) Involucrado(s) |
+| :--- | :--- | :--- |
+| **1** | **Crear el Adaptador de API** (Opcional pero recomendado). Implementa la lógica de autenticación y llamada HTTP específica del proveedor. | `src/infrastructure/ocr/adapters/nuevo_adapter.py` |
+| **2** | **Implementar el Procesador** (`IPageProcessor`). Crea una clase que sepa cómo rasterizar/enviar páginas a la API del Paso 1 y devolver `(markdown, image_urls)`. | `src/infrastructure/ocr/processors/nuevo_processor.py` |
+| **3** | **Registrar en la Fábrica**. Añade una condición `elif provider == "nuevo":` para instanciar tu clase del Paso 2. | `src/infrastructure/ocr/processors/factory.py` |
+| **4** | **Configurar Variable de Entorno**. Cambia el valor en tu `.env`. | `.env` (`OCR_PROVIDER=nuevo`) |
+
+### Ejemplo Conceptual (Mínimo Código)
+
+*No necesitas memorizar la implementación de Mistral. Solo necesitas cumplir el contrato `IPageProcessor`.*
+
+**Paso 2: Estructura mínima de `nuevo_processor.py`**
+```python
+from src.core.ports.page_processor import IPageProcessor
+
+class NuevoProcessor(IPageProcessor):
+    def __init__(self):
+        self.adapter = NuevoAdapter() # Clase creada en el Paso 1
+
+    async def process_pages(self, pdf_bytes, page_indices, doc_id):
+        results = {}
+        # 1. Abrir PDF con fitz
+        # 2. Por cada idx en page_indices:
+        #    - page = doc[idx]
+        #    - img_bytes = rasterizar(page)
+        #    - markdown = await self.adapter.call_api(img_bytes)
+        #    - results[idx] = (markdown, [])
+        return results
+```
+
+**Paso 3: Modificación en `factory.py`**
+```python
+# ... imports existentes ...
+from src.infrastructure.ocr.processors.nuevo_processor import NuevoProcessor
+
+def get_page_processor():
+    # ...
+    elif provider == "nuevo":
+        logger.info("Usando procesador NUEVO OCR")
+        return NuevoProcessor()
+    # ...
+```
+
+### Consideración de Rendimiento
+Si el nuevo proveedor **no acepta PDFs completos** (como DeepSeek), el sistema automáticamente realizará una llamada a la API **por página**. Esto funciona perfectamente, pero la latencia será mayor que en los proveedores que aceptan lotes (como Mistral).
+
+Si el nuevo proveedor **SÍ acepta lotes** (PDFs completos), puedes modificar el método `process_pages` para hacer una sola llamada y luego mapear los resultados a los índices solicitados, ahorrando así tiempo y dinero.

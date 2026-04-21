@@ -1,20 +1,34 @@
+"""
+Servicio de ingesta de documentos - Versión refactorizada con estrategias de chunking
+y metadatos de página en cada chunk.
+"""
+
 import os
+from typing import List
+
 from src.core.domain.chunk import Chunk
 from src.core.ports.ocr_provider import IOCRProvider
 from src.core.ports.embedding_provider import IEmbeddingProvider
 from src.core.ports.vector_store import IVectorStore
 from src.core.ports.database_repository import IDatabaseRepository
-from src.infrastructure.ocr.processors.factory import get_page_processor
+from src.core.ports.vision_provider import IVisionProvider
+
 from src.modules.ingestion.hybrid_router import HybridDocumentProcessor
 from src.modules.ingestion.chunker import DocumentChunker
-#from modules.ingestion.hybrid_router_mistral import HybridDocumentProcessor
+from src.modules.ingestion.image_enricher import ImageEnricher
+from src.modules.ingestion.normalizer import TextNormalizer
+from src.modules.ingestion.document_extractor import DocumentExtractor
+from src.core.domain.collection_type import CollectionType 
 from src.shared.logging import get_logger
+from src.infrastructure.chunking.factory import get_chunking_strategy
 
 logger = get_logger("ingestion_service")
 chunker = DocumentChunker()
+normalizer = TextNormalizer()
+
 
 async def process_document_task(
-    doc_id: str, 
+    doc_id: str,
     collection_id: str,
     file_bytes: bytes,
     mime_type: str,
@@ -22,86 +36,96 @@ async def process_document_task(
     ocr_adapter: IOCRProvider,
     embed_adapter: IEmbeddingProvider,
     vector_store: IVectorStore,
-    db_adapter: IDatabaseRepository
+    db_adapter: IDatabaseRepository,
+    vision_provider: IVisionProvider,
+    collection_type: str,
 ):
     try:
-        # 0. Cambiamos estado en Base de Datos a PROCESANDO
         db_adapter.update_document_status(doc_id, "processing")
-        
-        # Extraer extensión para los logs
         _, file_extension = os.path.splitext(original_filename)
-        logger.info(f"Iniciando procesamiento de documento", extra={
-            "doc_id": doc_id, 
-            "collection_id": collection_id, 
-            "extension": file_extension or "Desconocida",
-            "mime_type": mime_type
-        })
-        
-        page_processor = get_page_processor()
-        hybrid_processor = HybridDocumentProcessor(page_processor=page_processor)
-            
-        # 1. Estrategia de Extracción
-        if mime_type == "application/pdf":
-            logger.info(f"Archivo PDF detectado ({file_extension}). Iniciando Enrutamiento Híbrido.")
-            markdown_text = await hybrid_processor.process_pdf(file_bytes, doc_id)
-            
-        elif mime_type.startswith("image/"):
-            logger.info(f"Imagen detectada ({file_extension}). Enviando directamente al OCR Visual.")
-            markdown_text = await ocr_adapter.extract(file_bytes)
-            
-        elif mime_type.startswith("text/"):
-            logger.info(f"Archivo de texto detectado ({file_extension}). Extracción directa y gratuita.")
-            markdown_text = file_bytes.decode('utf-8', errors='ignore')
-            
-        else:
-            raise ValueError(f"Formato no soportado: {mime_type}")
-        
-# 2. Chunking Semántico
-        text_chunks = chunker.split_text(markdown_text)
-        total_chunks = len(text_chunks)
-        logger.info("Chunking completado", extra={"total_chunks": total_chunks})
-        
-        # =====================================================================
-        # 🛑 MODO PRUEBAS (DEBUG OCR): Desactivamos temporalmente los Embeddings
-        # y ChromaDB para no consumir cuota/dinero de Gemini mientras calibramos el OCR.
-        # =====================================================================
-        logger.warning("Modo Pruebas Activo: Se ha omitido la vectorización en Gemini y la persistencia en ChromaDB para ahorrar tokens.")
-        
-        """
-        # ---------------------------------------------------------------------
-        # CÓDIGO DE PRODUCCIÓN COMENTADO (Descomentar al finalizar pruebas OCR)
-        # ---------------------------------------------------------------------
-        
-        # TODO (Optimización de Rendimiento Futura - Batching): 
-        # Actualmente se procesa 1 a 1. Debemos actualizar el 'embed_adapter' para 
-        # que reciba la lista entera de 'text_chunks' y devuelva todos los vectores 
-        # en una sola llamada HTTP (Batch). Esto reducirá la latencia dramáticamente.
-        
-        chunks_to_save = []
-        for text in text_chunks:
-            embedding = embed_adapter.embed_text(text)
-            chunk = Chunk(document_id=doc_id, content=text, embedding=embedding)
-            chunks_to_save.append(chunk)
-            
-        # 4. Persistencia Aislada en ChromaDB
-        vector_store.upsert(collection_id, chunks_to_save)
-        """
-        
-        # 5. Actualizar Métricas y Estado FINAL a READY en PostgreSQL
-        db_adapter.update_metrics(collection_id=collection_id, doc_id=doc_id, new_chunks=total_chunks)
-        
-        logger.info("Procesamiento en segundo plano FINALIZADO con éxito (Sin Vectores)", extra={"doc_id": doc_id, "status": "ready"})
-            
-    except Exception as e:
-        # 1. El log guarda el error, stacktrace, doc_id y collection_id en logs/error.log
-        logger.error(
-            "Fallo critico en el pipeline de ingesta", 
-            exc_info=True, 
-            extra={
-                "doc_id": doc_id, 
-                "collection_id": collection_id
-            }
+
+        col_type = CollectionType.from_string(collection_type)
+
+        logger.info("Iniciando procesamiento de documento",
+                    extra={"doc_id": doc_id, "strategy": col_type})
+
+        # -------------------------------------------------------------
+        # 1. EXTRACCIÓN DE PÁGINAS (limpia, sin cabeceras)
+        # -------------------------------------------------------------
+        extractor = DocumentExtractor(ocr_adapter=ocr_adapter)
+        extracted_pages = await extractor.extract(
+            file_bytes=file_bytes,
+            mime_type=mime_type,
+            filename=original_filename,
+            doc_id=doc_id
         )
-        
-        # 2. La base de datos SOLO actualiza el estado. Cero deuda técnica.
+
+        # -------------------------------------------------------------
+        # 2. PROCESAMIENTO PÁGINA POR PÁGINA
+        # -------------------------------------------------------------
+        all_chunks: List[Chunk] = []
+        strategy = get_chunking_strategy(col_type)
+
+        for page in extracted_pages:
+            if not page.content:
+                logger.debug(f"Página {page.page_number} omitida (vacía)")
+                continue
+
+            # Normalizar contenido
+            clean_content = normalizer.normalize(page.content)
+
+            # Enriquecimiento de imágenes (multimodal)
+            enricher = ImageEnricher(vision_provider)
+            enriched_content, image_chunks = await enricher.extract_and_process(
+                clean_content,
+                doc_id,
+                page.page_number
+            )
+
+            # Metadatos base para esta página
+            base_metadata = {
+                "document_id": doc_id,
+                "collection_id": collection_id,
+                "source_filename": original_filename,
+                "page_number": page.page_number,
+                "page_type": page.page_type,
+            }
+
+            # Chunking del texto de esta página
+            text_chunks = strategy.split(enriched_content, base_metadata)
+
+            # Añadir metadatos de página a los chunks de imagen
+            # (Si ya vienen con page_number desde el enricher, podemos simplemente actualizar
+            # o mantener el que traen; por consistencia, actualizamos con todos los metadatos base)
+            for img_chunk in image_chunks:
+                img_chunk.metadata.update(base_metadata)
+
+            all_chunks.extend(text_chunks)
+            all_chunks.extend(image_chunks)
+            logger.info(f"Página {page.page_number}: {len(text_chunks)} texto + {len(image_chunks)} imagen")
+
+        total_chunks = len(all_chunks)
+        logger.info(f"Chunking completado: {total_chunks} chunks totales")
+        # -------------------------------------------------------------
+        # 3. EMBEDDING Y PERSISTENCIA (SIEMPRE ACTIVO)
+        # -------------------------------------------------------------
+        # Extraer todos los contenidos
+        texts = [chunk.content for chunk in all_chunks]
+
+        # Generar todos los embeddings en una (o pocas) llamadas
+        embeddings = embed_adapter.embed_batch(texts)
+
+        # Asignar cada embedding a su chunk
+        for chunk, emb in zip(all_chunks, embeddings):
+            chunk.embedding = emb
+
+        vector_store.upsert(collection_id, all_chunks)
+        logger.info("Vectores guardados en ChromaDB")
+
+        db_adapter.update_metrics(collection_id=collection_id, doc_id=doc_id, new_chunks=total_chunks)
+        db_adapter.update_document_status(doc_id, "ready")
+        logger.info("Procesamiento FINALIZADO con éxito", extra={"doc_id": doc_id})
+
+    except Exception as e:
+        logger.error("Fallo critico en el pipeline", exc_info=True, extra={"doc_id": doc_id})
         db_adapter.update_document_status(doc_id, "failed")

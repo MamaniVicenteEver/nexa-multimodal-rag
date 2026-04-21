@@ -1,9 +1,10 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional, Dict, Any
+from src.core.domain.collection_type import CollectionType
 
 class IDatabaseRepository(ABC):
     @abstractmethod
-    def create_collection(self, collection_id: str, name: str, description: Optional[str]) -> Dict[str, Any]:
+    def create_collection(self, collection_id: str, name: str, description: Optional[str], collection_type: CollectionType) -> Dict[str, Any]:
         pass
 
     @abstractmethod
